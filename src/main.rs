@@ -1,6 +1,6 @@
+use libadwaita as adw;
 use adw::prelude::*;
 use adw::{Application, ApplicationWindow, HeaderBar};
-use glib::clone;
 use gtk4::{Align, Box as GtkBox, Button, Entry, Orientation, ScrolledWindow, Label};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,34 +16,27 @@ pub enum UiMessage {
     Error(String),
 }
 
-/// Simple JSON structure to parse the stream-json output (can be expanded later)
+/// Simple JSON structure to parse the stream-json output
 #[derive(Deserialize, Debug)]
 struct GeminiStreamOutput {
-    // Modify based on the actual CLI stream-json schema
     text: Option<String>,
     error: Option<String>,
 }
 
 fn main() -> glib::ExitCode {
-    // Initialize the Tokio runtime
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime");
-
     // Initialize the libadwaita application
     let app = Application::builder()
         .application_id("com.github.redminote11tech.GeminiExtended")
         .build();
 
     app.connect_activate(move |app| {
-        build_ui(app, &rt);
+        build_ui(app);
     });
 
     app.run()
 }
 
-fn build_ui(app: &Application, rt: &tokio::runtime::Runtime) {
+fn build_ui(app: &Application) {
     // 1. Setup the main window and GTK Box layout
     let window = ApplicationWindow::builder()
         .application(app)
@@ -95,103 +88,112 @@ fn build_ui(app: &Application, rt: &tokio::runtime::Runtime) {
     window.set_content(Some(&main_box));
 
     // 5. Establish IPC Channels
-    // Channel A: Tokio -> GTK (glib::MainContext::channel)
-    let (ui_sender, ui_receiver) = glib::MainContext::channel::<UiMessage>(glib::Priority::DEFAULT);
-    
-    // Channel B: GTK -> Tokio (mpsc)
+    // Channel A: Tokio -> GTK
+    let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
+    // Channel B: GTK -> Tokio
     let (async_sender, mut async_receiver) = mpsc::channel::<String>(32);
 
     // 6. Handle incoming messages to update the GTK UI
-    ui_receiver.attach(
-        None,
-        clone!(@weak chat_box, @weak scroll_window => @default-return glib::ControlFlow::Break,
-            move |msg| {
-                let text = match msg {
-                    UiMessage::NewUserMessage(m) => format!("User: {}", m),
-                    UiMessage::SystemMessage(m) => format!("System: {}", m),
-                    UiMessage::EngineOutput(m) => format!("Gemini: {}", m),
-                    UiMessage::Error(m) => format!("Error: {}", m),
-                };
-
-                let label = Label::builder()
-                    .label(&text)
-                    .wrap(true)
-                    .xalign(0.0)
-                    .selectable(true)
-                    .build();
-
-                chat_box.append(&label);
-
-                // Auto-scroll to bottom
-                let adjustment = scroll_window.vadjustment();
-                adjustment.set_value(adjustment.upper() - adjustment.page_size());
-
-                glib::ControlFlow::Continue
-            }
-        ),
-    );
-
-    // 7. Spawn the Async Backend loop
-    let ui_sender_clone = ui_sender.clone();
-    rt.spawn(async move {
-        while let Some(prompt) = async_receiver.recv().await {
-            ui_sender_clone.send(UiMessage::SystemMessage("Spawning gemini-cli...".to_string())).unwrap();
-
-            let mut child = match Command::new("gemini")
-                .arg("-p")
-                .arg(&prompt)
-                .arg("-o")
-                .arg("stream-json")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn() 
-            {
-                Ok(child) => child,
-                Err(e) => {
-                    ui_sender_clone.send(UiMessage::Error(format!("Failed to spawn CLI: {}", e))).unwrap();
-                    continue;
-                }
+    let chat_box_clone = chat_box.clone();
+    let scroll_window_clone = scroll_window.clone();
+    
+    glib::spawn_future_local(async move {
+        while let Some(msg) = ui_receiver.recv().await {
+            let text = match msg {
+                UiMessage::NewUserMessage(m) => format!("User: {}", m),
+                UiMessage::SystemMessage(m) => format!("System: {}", m),
+                UiMessage::EngineOutput(m) => format!("Gemini: {}", m),
+                UiMessage::Error(m) => format!("Error: {}", m),
             };
 
-            let stdout = child.stdout.take().expect("Failed to grab stdout");
-            let mut reader = BufReader::new(stdout).lines();
+            let label = Label::builder()
+                .label(&text)
+                .wrap(true)
+                .xalign(0.0)
+                .selectable(true)
+                .build();
 
-            while let Ok(Some(line)) = reader.next_line().await {
-                // Parse JSON stream from CLI
-                if let Ok(parsed) = serde_json::from_str::<GeminiStreamOutput>(&line) {
-                    if let Some(txt) = parsed.text {
-                        ui_sender_clone.send(UiMessage::EngineOutput(txt)).unwrap();
-                    }
-                    if let Some(err) = parsed.error {
-                        ui_sender_clone.send(UiMessage::Error(err)).unwrap();
-                    }
-                } else {
-                    // Fallback for raw text just in case
-                    ui_sender_clone.send(UiMessage::EngineOutput(line)).unwrap();
-                }
-            }
+            chat_box_clone.append(&label);
 
-            ui_sender_clone.send(UiMessage::SystemMessage("CLI process finished.".to_string())).unwrap();
+            // Auto-scroll to bottom (Wait for GTK to update layout)
+            let adjustment = scroll_window_clone.vadjustment();
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
         }
     });
 
+    // 7. Spawn the Async Backend loop
+    let ui_sender_clone = ui_sender.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            while let Some(prompt) = async_receiver.recv().await {
+                ui_sender_clone.send(UiMessage::SystemMessage("Spawning gemini-cli...".to_string())).await.unwrap();
+
+                let mut child = match Command::new("gemini")
+                    .arg("-p")
+                    .arg(&prompt)
+                    .arg("-o")
+                    .arg("stream-json")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn() 
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        ui_sender_clone.send(UiMessage::Error(format!("Failed to spawn CLI: {}", e))).await.unwrap();
+                        continue;
+                    }
+                };
+
+                let stdout = child.stdout.take().expect("Failed to grab stdout");
+                let mut reader = BufReader::new(stdout).lines();
+
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Ok(parsed) = serde_json::from_str::<GeminiStreamOutput>(&line) {
+                        if let Some(txt) = parsed.text {
+                            ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap();
+                        }
+                        if let Some(err) = parsed.error {
+                            ui_sender_clone.send(UiMessage::Error(err)).await.unwrap();
+                        }
+                    } else {
+                        ui_sender_clone.send(UiMessage::EngineOutput(line)).await.unwrap();
+                    }
+                }
+                
+                ui_sender_clone.send(UiMessage::SystemMessage("CLI process finished.".to_string())).await.unwrap();
+            }
+        });
+    });
+
     // 8. Connect User Input Events
-    let send_action = clone!(@weak prompt_entry, @strong async_sender, @strong ui_sender => move || {
-        let text = prompt_entry.text().to_string();
+    let async_sender_clone = async_sender.clone();
+    let prompt_entry_clone = prompt_entry.clone();
+    let ui_sender_input = ui_sender.clone();
+
+    let send_action = move || {
+        let text = prompt_entry_clone.text().to_string();
         if !text.trim().is_empty() {
-            prompt_entry.set_text("");
-            ui_sender.send(UiMessage::NewUserMessage(text.clone())).unwrap();
+            prompt_entry_clone.set_text("");
             
-            let async_sender = async_sender.clone();
+            let async_sender_local = async_sender_clone.clone();
+            let ui_sender_local = ui_sender_input.clone();
+            
             glib::spawn_future_local(async move {
-                if let Err(e) = async_sender.send(text).await {
+                ui_sender_local.send(UiMessage::NewUserMessage(text.clone())).await.unwrap();
+                if let Err(e) = async_sender_local.send(text).await {
                     eprintln!("Failed to send to async runtime: {}", e);
                 }
             });
         }
-    });
+    };
 
-    send_button.connect_clicked(clone!(@strong send_action => move |_| send_action()));
+    let send_action_clone = send_action.clone();
+    send_button.connect_clicked(move |_| send_action_clone());
     prompt_entry.connect_activate(move |_| send_action());
 
     window.present();
