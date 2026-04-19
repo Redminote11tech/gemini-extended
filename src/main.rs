@@ -1,6 +1,6 @@
 use libadwaita as adw;
 use adw::prelude::*;
-use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView, Clamp, StyleManager, ActionRow};
+use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView, Clamp, StyleManager};
 use gtk4::{Align, Box as GtkBox, Button, Entry, Orientation, ScrolledWindow, Label, CssProvider, FileDialog, MenuButton, Popover, Switch, Image, Paned, ListBox, ListBoxRow};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -19,6 +19,7 @@ pub enum UiMessage {
     Error(String),
     Done,
     SessionsLoaded(Vec<String>),
+    ClearChat,
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,10 +115,23 @@ fn load_css() {
         .welcome-subtitle { font-size: 1.2em; color: @dim_label_color; margin-top: 8px; }
 
         /* Accent Colors Variants */
+        .color-swatch {
+            min-width: 32px;
+            min-height: 32px;
+            border-radius: 50%;
+            padding: 0;
+            margin: 0 6px;
+            border: 2px solid transparent;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+        }
+        .color-swatch:hover { opacity: 0.8; }
+        .swatch-blue { background-color: #3584e4; }
+        .swatch-green { background-color: #2ec27e; }
+        .swatch-purple { background-color: #813d9c; }
+
         .theme-blue { @define-color accent_color #3584e4; @define-color accent_bg_color #3584e4; @define-color accent_fg_color #ffffff; }
         .theme-green { @define-color accent_color #2ec27e; @define-color accent_bg_color #2ec27e; @define-color accent_fg_color #ffffff; }
         .theme-purple { @define-color accent_color #813d9c; @define-color accent_bg_color #813d9c; @define-color accent_fg_color #ffffff; }
-        .theme-red { @define-color accent_color #e01b24; @define-color accent_bg_color #e01b24; @define-color accent_fg_color #ffffff; }
         "
     );
     gtk4::style_context_add_provider_for_display(
@@ -141,6 +155,11 @@ fn build_ui(app: &Application) {
 
     let paned = Paned::builder().orientation(Orientation::Horizontal).hexpand(true).vexpand(true).build();
 
+    // --- State Variables ---
+    let current_dir = Rc::new(RefCell::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))));
+    let yolo_mode = Rc::new(RefCell::new(false));
+    let active_session: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
     // --- SIDEBAR (Sessions) ---
     let sidebar_box = GtkBox::new(Orientation::Vertical, 0);
     sidebar_box.add_css_class("sidebar");
@@ -162,22 +181,23 @@ fn build_ui(app: &Application) {
         .css_classes(["navigation-sidebar"])
         .build();
     
-    // Add loading placeholder
-    let loading_row = Label::builder().label("Loading sessions...").css_classes(["dim-label"]).margin_top(16).build();
+    // Add loading placeholder (unselectable)
+    let loading_label = Label::builder().label("Loading sessions...").css_classes(["dim-label"]).margin_top(16).build();
+    let loading_row = ListBoxRow::builder()
+        .child(&loading_label)
+        .activatable(false)
+        .selectable(false)
+        .build();
     sessions_list.append(&loading_row);
     
     sessions_scroll.set_child(Some(&sessions_list));
     sidebar_box.append(&sessions_scroll);
-    
     paned.set_start_child(Some(&sidebar_box));
 
     // --- MAIN CONTENT AREA ---
     let content_toolbar_view = ToolbarView::builder().hexpand(true).vexpand(true).build();
     let header_bar = HeaderBar::builder().css_classes(["material-header"]).build();
     content_toolbar_view.add_top_bar(&header_bar);
-
-    let current_dir = Rc::new(RefCell::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))));
-    let yolo_mode = Rc::new(RefCell::new(false));
 
     // Workspace Button
     let workspace_box = GtkBox::new(Orientation::Horizontal, 6);
@@ -205,7 +225,7 @@ fn build_ui(app: &Application) {
                 if let Some(path) = folder.path() {
                     *current_dir_clone.borrow_mut() = path.clone();
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    dir_label_clone.set_label(&*name);
+                    dir_label_clone.set_label(&name);
                 }
             }
         });
@@ -230,15 +250,15 @@ fn build_ui(app: &Application) {
     yolo_box.append(&yolo_switch);
     popover_box.append(&yolo_box);
 
-    // Accent Color Row (Little Feels)
+    // Accent Color Row (Fixed Swatches, No Tick)
     let theme_box = GtkBox::new(Orientation::Horizontal, 12);
     theme_box.set_margin_top(8);
     let theme_label = Label::builder().label("Accent Color").hexpand(true).xalign(0.0).build();
     theme_box.append(&theme_label);
     
-    let btn_blue = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
-    let btn_green = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
-    let btn_purple = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
+    let btn_blue = Button::builder().css_classes(["color-swatch", "swatch-blue"]).build();
+    let btn_green = Button::builder().css_classes(["color-swatch", "swatch-green"]).build();
+    let btn_purple = Button::builder().css_classes(["color-swatch", "swatch-purple"]).build();
     
     let window_theme_clone = window.clone();
     btn_blue.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-blue"]); });
@@ -298,7 +318,6 @@ fn build_ui(app: &Application) {
         .css_classes(["flat", "material-entry"])
         .build();
     
-    // Up Arrow (Send) instead of cross/disapproval sign
     let send_button = Button::builder()
         .icon_name("go-up-symbolic")
         .css_classes(["material-send-btn"])
@@ -320,16 +339,71 @@ fn build_ui(app: &Application) {
 
     // --- Channels & IPC ---
     let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
-    let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool)>(32);
+    let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool, Option<String>)>(32);
 
     let chat_box_clone = chat_box.clone();
     let scroll_window_clone = scroll_window.clone();
     let sessions_list_clone = sessions_list.clone();
     let loading_row_clone = loading_row.clone();
+    let welcome_box_clone = welcome_box.clone();
     
     let current_bot_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
     let current_system_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
-    let welcome_box_ref = Rc::new(RefCell::new(Some(welcome_box)));
+
+    // --- Interaction Closures ---
+    
+    let clear_chat = Rc::new({
+        let chat_box_for_clear = chat_box.clone();
+        let welcome_box_for_clear = welcome_box.clone();
+        move || {
+            let mut child = chat_box_for_clear.first_child();
+            while let Some(c) = child {
+                let next = c.next_sibling();
+                if c != welcome_box_for_clear {
+                    chat_box_for_clear.remove(&c);
+                }
+                child = next;
+            }
+        }
+    });
+
+    // New Chat Button Handler
+    let active_session_nc = active_session.clone();
+    let clear_chat_nc = clear_chat.clone();
+    let welcome_box_nc = welcome_box.clone();
+    new_chat_btn.connect_clicked(move |_| {
+        *active_session_nc.borrow_mut() = None;
+        clear_chat_nc();
+        welcome_box_nc.set_visible(true);
+    });
+
+    // Session Select Handler
+    let active_session_row = active_session.clone();
+    let clear_chat_row = clear_chat.clone();
+    let welcome_box_row = welcome_box.clone();
+    let ui_sender_row = ui_sender.clone();
+    
+    sessions_list.connect_row_activated(move |_, row| {
+        if let Some(child) = row.first_child() {
+            if let Ok(label) = child.downcast::<Label>() {
+                let text = label.label().to_string();
+                if let Some(start) = text.rfind('[') {
+                    if let Some(end) = text.rfind(']') {
+                        let id = text[start+1..end].to_string();
+                        *active_session_row.borrow_mut() = Some(id);
+                        
+                        clear_chat_row();
+                        welcome_box_row.set_visible(false);
+                        
+                        let sender = ui_sender_row.clone();
+                        glib::spawn_future_local(async move {
+                            sender.send(UiMessage::SystemMessage(format!("Resumed session. Type a message to continue this conversation..."))).await.unwrap();
+                        });
+                    }
+                }
+            }
+        }
+    });
 
     // --- UI Update Loop (GTK Thread) ---
     glib::spawn_future_local(async move {
@@ -339,18 +413,26 @@ fn build_ui(app: &Application) {
                     sessions_list_clone.remove(&loading_row_clone);
                     if sessions.is_empty() {
                         let lbl = Label::builder().label("No recent sessions found.").css_classes(["dim-label"]).margin_top(16).build();
-                        sessions_list_clone.append(&lbl);
+                        let row = ListBoxRow::builder().child(&lbl).activatable(false).selectable(false).build();
+                        sessions_list_clone.append(&row);
                     } else {
                         for s in sessions {
-                            let row = ListBoxRow::builder().child(&Label::builder().label(&s).xalign(0.0).css_classes(["sidebar-item"]).ellipsize(gtk4::pango::EllipsizeMode::End).build()).build();
+                            let label = Label::builder().label(&s).xalign(0.0).css_classes(["sidebar-item"]).ellipsize(gtk4::pango::EllipsizeMode::End).build();
+                            let row = ListBoxRow::builder().child(&label).build();
                             sessions_list_clone.append(&row);
                         }
                     }
                 }
-                UiMessage::NewUserMessage(m) => {
-                    if let Some(wb) = welcome_box_ref.borrow_mut().take() {
-                        chat_box_clone.remove(&wb);
+                UiMessage::ClearChat => {
+                    let mut child = chat_box_clone.first_child();
+                    while let Some(c) = child {
+                        let next = c.next_sibling();
+                        if c != welcome_box_clone { chat_box_clone.remove(&c); }
+                        child = next;
                     }
+                }
+                UiMessage::NewUserMessage(m) => {
+                    welcome_box_clone.set_visible(false);
                     *current_bot_label.borrow_mut() = None;
                     *current_system_label.borrow_mut() = None;
 
@@ -433,17 +515,13 @@ fn build_ui(app: &Application) {
                 for line in out_str.lines() {
                     let trimmed = line.trim();
                     if trimmed.starts_with(char::is_numeric) {
-                        if let Some(session_text) = trimmed.split("] ").last() {
-                            sessions.push(session_text.to_string());
-                        } else {
-                            sessions.push(trimmed.to_string());
-                        }
+                        sessions.push(trimmed.to_string());
                     }
                 }
                 ui_sender_clone.send(UiMessage::SessionsLoaded(sessions)).await.unwrap();
             }
 
-            while let Some((prompt, cwd, yolo)) = async_receiver.recv().await {
+            while let Some((prompt, cwd, yolo, session_id)) = async_receiver.recv().await {
                 ui_sender_clone.send(UiMessage::SystemMessage("Thinking...".to_string())).await.unwrap();
 
                 let mut cmd = Command::new("gemini");
@@ -457,6 +535,9 @@ fn build_ui(app: &Application) {
 
                 if yolo {
                     cmd.arg("-y");
+                }
+                if let Some(sid) = session_id {
+                    cmd.arg("-r").arg(&sid);
                 }
 
                 let mut child = match cmd.spawn() {
@@ -500,6 +581,7 @@ fn build_ui(app: &Application) {
     let ui_sender_input = ui_sender.clone();
     let current_dir_action = current_dir.clone();
     let yolo_action = yolo_mode.clone();
+    let active_session_action = active_session.clone();
 
     let send_action = move || {
         let text = prompt_entry_clone.text().to_string();
@@ -510,10 +592,11 @@ fn build_ui(app: &Application) {
             let ui_sender_local = ui_sender_input.clone();
             let cwd = current_dir_action.borrow().clone();
             let yolo = *yolo_action.borrow();
+            let session = active_session_action.borrow().clone();
             
             glib::spawn_future_local(async move {
                 ui_sender_local.send(UiMessage::NewUserMessage(text.clone())).await.unwrap();
-                if let Err(e) = async_sender_local.send((text, cwd, yolo)).await {
+                if let Err(e) = async_sender_local.send((text, cwd, yolo, session)).await {
                     eprintln!("Failed to send to async runtime: {}", e);
                 }
             });
