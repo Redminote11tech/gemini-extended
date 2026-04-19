@@ -1,7 +1,7 @@
 use libadwaita as adw;
 use adw::prelude::*;
-use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView, Clamp, StyleManager};
-use gtk4::{Align, Box as GtkBox, Button, Entry, Orientation, ScrolledWindow, Label, CssProvider, FileDialog, MenuButton, Popover, Switch, Image};
+use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView, Clamp, StyleManager, ActionRow};
+use gtk4::{Align, Box as GtkBox, Button, Entry, Orientation, ScrolledWindow, Label, CssProvider, FileDialog, MenuButton, Popover, Switch, Image, Paned, ListBox, ListBoxRow};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -15,8 +15,10 @@ pub enum UiMessage {
     NewUserMessage(String),
     SystemMessage(String),
     EngineOutput(String),
+    ToolUse(String, String),
     Error(String),
     Done,
+    SessionsLoaded(Vec<String>),
 }
 
 #[derive(Deserialize, Debug)]
@@ -27,25 +29,31 @@ struct RawStream {
     content: Option<String>,
     status: Option<String>,
     error: Option<String>,
+    tool_name: Option<String>,
+    parameters: Option<serde_json::Value>,
 }
 
 fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         "
-        .material-window {
-            background-color: @window_bg_color;
-        }
-        .material-header {
-            background: transparent;
-            border-bottom: none;
-            box-shadow: none;
-        }
-        .material-chat-view {
-            background-color: transparent;
-        }
+        .material-window { background-color: @window_bg_color; }
+        .material-header { background: transparent; border-bottom: none; box-shadow: none; }
+        .material-chat-view { background-color: transparent; }
         
-        /* Chat Bubbles */
+        .sidebar {
+            background-color: @view_bg_color;
+            border-right: 1px solid @border_color;
+        }
+        .sidebar-item {
+            padding: 12px 16px;
+            font-size: 0.95em;
+            color: @window_fg_color;
+            border-radius: 8px;
+            margin: 2px 8px;
+        }
+        .sidebar-item:hover { background-color: @card_shade_color; }
+        
         .user-bubble { 
             background-color: @accent_bg_color; 
             color: @accent_fg_color; 
@@ -63,23 +71,22 @@ fn load_css() {
             font-size: 1.05em;
             line-height: 1.6;
         }
-        .bot-icon {
-            color: @accent_bg_color;
-            margin-right: 16px;
-            margin-top: 4px;
+        .bot-icon { color: @accent_bg_color; margin-right: 16px; margin-top: 4px; }
+        .system-bubble { color: @dim_label_color; font-style: italic; font-size: 0.9em; margin: 8px 0; }
+        
+        /* Artifact / Tool Call Card */
+        .tool-card {
+            background-color: @card_bg_color;
+            border: 1px solid @card_shade_color;
+            border-radius: 12px;
+            padding: 12px;
+            margin: 8px 0px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         }
-        .system-bubble { 
-            color: @dim_label_color; 
-            font-style: italic; 
-            font-size: 0.9em;
-            margin: 8px 0;
-        }
+        .tool-header { font-weight: bold; color: @accent_color; margin-bottom: 4px; }
+        .tool-desc { font-family: monospace; font-size: 0.9em; color: @dim_label_color; }
 
-        /* Material Input Bar */
-        .material-input-container {
-            background: transparent;
-            padding: 12px 24px 32px 24px;
-        }
+        .material-input-container { background: transparent; padding: 12px 24px 32px 24px; }
         .material-search-bar {
             background-color: @card_bg_color;
             border-radius: 32px;
@@ -87,16 +94,9 @@ fn load_css() {
             box-shadow: 0 4px 12px rgba(0,0,0,0.1);
             border: 1px solid @window_bg_color;
         }
-        .material-entry {
-            background: transparent;
-            border: none;
-            box-shadow: none;
-            font-size: 1.1em;
-        }
-        .material-entry:focus {
-            outline: none;
-            box-shadow: none;
-        }
+        .material-entry { background: transparent; border: none; box-shadow: none; font-size: 1.1em; }
+        .material-entry:focus { outline: none; box-shadow: none; }
+        
         .material-send-btn {
             border-radius: 50%;
             background-color: @accent_bg_color;
@@ -108,26 +108,16 @@ fn load_css() {
             box-shadow: 0 2px 4px rgba(0,0,0,0.2);
             transition: all 0.2s ease;
         }
-        .material-send-btn:hover {
-            background-image: image(rgba(255,255,255,0.1));
-            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
-        }
-        .workspace-btn {
-            border-radius: 18px;
-            font-weight: bold;
-            background-color: @card_bg_color;
-        }
-        .welcome-title {
-            font-size: 2.5em;
-            font-weight: bold;
-            color: @window_fg_color;
-            margin-top: 16px;
-        }
-        .welcome-subtitle {
-            font-size: 1.2em;
-            color: @dim_label_color;
-            margin-top: 8px;
-        }
+        .material-send-btn:hover { background-image: image(rgba(255,255,255,0.1)); box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+        .workspace-btn { border-radius: 18px; font-weight: bold; background-color: @card_bg_color; }
+        .welcome-title { font-size: 2.5em; font-weight: bold; color: @window_fg_color; margin-top: 16px; }
+        .welcome-subtitle { font-size: 1.2em; color: @dim_label_color; margin-top: 8px; }
+
+        /* Accent Colors Variants */
+        .theme-blue { @define-color accent_color #3584e4; @define-color accent_bg_color #3584e4; @define-color accent_fg_color #ffffff; }
+        .theme-green { @define-color accent_color #2ec27e; @define-color accent_bg_color #2ec27e; @define-color accent_fg_color #ffffff; }
+        .theme-purple { @define-color accent_color #813d9c; @define-color accent_bg_color #813d9c; @define-color accent_fg_color #ffffff; }
+        .theme-red { @define-color accent_color #e01b24; @define-color accent_bg_color #e01b24; @define-color accent_fg_color #ffffff; }
         "
     );
     gtk4::style_context_add_provider_for_display(
@@ -139,36 +129,60 @@ fn load_css() {
 
 fn build_ui(app: &Application) {
     load_css();
-
-    // Default System Theme (Follow OS settings automatically)
     StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Gemini Extended")
-        .default_width(950)
+        .default_width(1100)
         .default_height(800)
         .css_classes(["material-window"])
         .build();
 
-    let toolbar_view = ToolbarView::builder().build();
-    let header_bar = HeaderBar::builder().css_classes(["material-header"]).build();
-    toolbar_view.add_top_bar(&header_bar);
+    let paned = Paned::builder().orientation(Orientation::Horizontal).hexpand(true).vexpand(true).build();
 
-    // --- State Variables ---
+    // --- SIDEBAR (Sessions) ---
+    let sidebar_box = GtkBox::new(Orientation::Vertical, 0);
+    sidebar_box.add_css_class("sidebar");
+    sidebar_box.set_size_request(280, -1);
+    
+    let sidebar_header = HeaderBar::builder().show_end_title_buttons(false).build();
+    sidebar_box.append(&sidebar_header);
+
+    let new_chat_btn = Button::builder()
+        .label("New Chat")
+        .css_classes(["suggested-action", "pill"])
+        .margin_top(12).margin_bottom(12).margin_start(16).margin_end(16)
+        .build();
+    sidebar_box.append(&new_chat_btn);
+
+    let sessions_scroll = ScrolledWindow::builder().hexpand(true).vexpand(true).build();
+    let sessions_list = ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
+    
+    // Add loading placeholder
+    let loading_row = Label::builder().label("Loading sessions...").css_classes(["dim-label"]).margin_top(16).build();
+    sessions_list.append(&loading_row);
+    
+    sessions_scroll.set_child(Some(&sessions_list));
+    sidebar_box.append(&sessions_scroll);
+    
+    paned.set_start_child(Some(&sidebar_box));
+
+    // --- MAIN CONTENT AREA ---
+    let content_toolbar_view = ToolbarView::builder().hexpand(true).vexpand(true).build();
+    let header_bar = HeaderBar::builder().css_classes(["material-header"]).build();
+    content_toolbar_view.add_top_bar(&header_bar);
+
     let current_dir = Rc::new(RefCell::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))));
     let yolo_mode = Rc::new(RefCell::new(false));
 
-    // --- Header: Workspace Selection ---
+    // Workspace Button
     let workspace_box = GtkBox::new(Orientation::Horizontal, 6);
     workspace_box.set_halign(Align::Center);
-    
-    let dir_button = Button::builder()
-        .css_classes(["workspace-btn", "flat"])
-        .tooltip_text("Change contained working directory")
-        .build();
-    
-    // Initial folder name setup
+    let dir_button = Button::builder().css_classes(["workspace-btn", "flat"]).tooltip_text("Change contained directory").build();
     let folder_name = current_dir.borrow().file_name().unwrap_or_default().to_string_lossy().to_string();
     let btn_content = GtkBox::new(Orientation::Horizontal, 6);
     let folder_icon = Image::from_icon_name("folder-open-symbolic");
@@ -176,7 +190,6 @@ fn build_ui(app: &Application) {
     btn_content.append(&folder_icon);
     btn_content.append(&dir_label);
     dir_button.set_child(Some(&btn_content));
-    
     workspace_box.append(&dir_button);
     header_bar.set_title_widget(Some(&workspace_box));
 
@@ -198,20 +211,13 @@ fn build_ui(app: &Application) {
         });
     });
 
-    // --- Header: Settings Menu (YOLO Mode Only, System Theme is auto) ---
-    let settings_menu = MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("Settings & Permissions")
-        .build();
-    
+    // Settings Menu
+    let settings_menu = MenuButton::builder().icon_name("open-menu-symbolic").tooltip_text("Settings & Theme").build();
     let popover = Popover::builder().build();
     let popover_box = GtkBox::new(Orientation::Vertical, 12);
-    popover_box.set_margin_start(16);
-    popover_box.set_margin_end(16);
-    popover_box.set_margin_top(16);
-    popover_box.set_margin_bottom(16);
+    popover_box.set_margin_start(16); popover_box.set_margin_end(16); popover_box.set_margin_top(16); popover_box.set_margin_bottom(16);
 
-    // YOLO Mode Toggle
+    // YOLO Toggle
     let yolo_box = GtkBox::new(Orientation::Horizontal, 12);
     let yolo_label = Label::builder().label("<b>Auto-Approve (YOLO)</b>").use_markup(true).hexpand(true).xalign(0.0).build();
     let yolo_switch = Switch::new();
@@ -222,43 +228,55 @@ fn build_ui(app: &Application) {
     });
     yolo_box.append(&yolo_label);
     yolo_box.append(&yolo_switch);
-
     popover_box.append(&yolo_box);
+
+    // Accent Color Row (Little Feels)
+    let theme_box = GtkBox::new(Orientation::Horizontal, 12);
+    theme_box.set_margin_top(8);
+    let theme_label = Label::builder().label("Accent Color").hexpand(true).xalign(0.0).build();
+    theme_box.append(&theme_label);
+    
+    let btn_blue = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
+    let btn_green = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
+    let btn_purple = Button::builder().icon_name("object-select-symbolic").css_classes(["circular"]).build();
+    
+    let window_theme_clone = window.clone();
+    btn_blue.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-blue"]); });
+    let window_theme_clone = window.clone();
+    btn_green.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-green"]); });
+    let window_theme_clone = window.clone();
+    btn_purple.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-purple"]); });
+    
+    theme_box.append(&btn_blue);
+    theme_box.append(&btn_green);
+    theme_box.append(&btn_purple);
+    popover_box.append(&theme_box);
+
     popover.set_child(Some(&popover_box));
     settings_menu.set_popover(Some(&popover));
     header_bar.pack_end(&settings_menu);
 
-    // --- Chat View ---
+    // Chat View
     let scroll_window = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
+        .hexpand(true).vexpand(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .css_classes(["material-chat-view"])
         .build();
 
     let clamp_chat = Clamp::builder().maximum_size(850).build();
-    
     let chat_box = GtkBox::new(Orientation::Vertical, 12);
-    chat_box.set_margin_top(32);
-    chat_box.set_margin_bottom(32);
-    chat_box.set_margin_start(24);
-    chat_box.set_margin_end(24);
+    chat_box.set_margin_top(32); chat_box.set_margin_bottom(32); chat_box.set_margin_start(24); chat_box.set_margin_end(24);
     
-    // Welcome Screen / Empty State
+    // Welcome Screen
     let welcome_box = GtkBox::new(Orientation::Vertical, 0);
-    welcome_box.set_valign(Align::Center);
-    welcome_box.set_vexpand(true);
-    
+    welcome_box.set_valign(Align::Center); welcome_box.set_vexpand(true);
     let welcome_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(80).build();
     welcome_icon.add_css_class("accent");
-    
     let welcome_title = Label::builder().label("Hello, I'm Gemini").css_classes(["welcome-title"]).build();
     let welcome_subtitle = Label::builder().label("How can I help you today?").css_classes(["welcome-subtitle"]).build();
-    
     welcome_box.append(&welcome_icon);
     welcome_box.append(&welcome_title);
     welcome_box.append(&welcome_subtitle);
-    
     chat_box.append(&welcome_box);
 
     clamp_chat.set_child(Some(&chat_box));
@@ -267,12 +285,10 @@ fn build_ui(app: &Application) {
     let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.append(&scroll_window);
 
-    // --- Input Area (Material Search Bar) ---
+    // Input Area
     let input_container = GtkBox::new(Orientation::Vertical, 0);
     input_container.add_css_class("material-input-container");
-
     let clamp_input = Clamp::builder().maximum_size(850).build();
-    
     let input_box = GtkBox::new(Orientation::Horizontal, 0);
     input_box.add_css_class("material-search-bar");
     
@@ -282,8 +298,9 @@ fn build_ui(app: &Application) {
         .css_classes(["flat", "material-entry"])
         .build();
     
+    // Up Arrow (Send) instead of cross/disapproval sign
     let send_button = Button::builder()
-        .icon_name("send-symbolic")
+        .icon_name("go-up-symbolic")
         .css_classes(["material-send-btn"])
         .tooltip_text("Send prompt")
         .build();
@@ -294,8 +311,12 @@ fn build_ui(app: &Application) {
     input_container.append(&clamp_input);
     main_box.append(&input_container);
 
-    toolbar_view.set_content(Some(&main_box));
-    window.set_content(Some(&toolbar_view));
+    content_toolbar_view.set_content(Some(&main_box));
+    paned.set_end_child(Some(&content_toolbar_view));
+    
+    // Default ratio
+    paned.set_position(280);
+    window.set_content(Some(&paned));
 
     // --- Channels & IPC ---
     let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
@@ -303,6 +324,8 @@ fn build_ui(app: &Application) {
 
     let chat_box_clone = chat_box.clone();
     let scroll_window_clone = scroll_window.clone();
+    let sessions_list_clone = sessions_list.clone();
+    let loading_row_clone = loading_row.clone();
     
     let current_bot_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
     let current_system_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
@@ -312,12 +335,22 @@ fn build_ui(app: &Application) {
     glib::spawn_future_local(async move {
         while let Some(msg) = ui_receiver.recv().await {
             match msg {
+                UiMessage::SessionsLoaded(sessions) => {
+                    sessions_list_clone.remove(&loading_row_clone);
+                    if sessions.is_empty() {
+                        let lbl = Label::builder().label("No recent sessions found.").css_classes(["dim-label"]).margin_top(16).build();
+                        sessions_list_clone.append(&lbl);
+                    } else {
+                        for s in sessions {
+                            let row = ListBoxRow::builder().child(&Label::builder().label(&s).xalign(0.0).css_classes(["sidebar-item"]).ellipsize(gtk4::pango::EllipsizeMode::End).build()).build();
+                            sessions_list_clone.append(&row);
+                        }
+                    }
+                }
                 UiMessage::NewUserMessage(m) => {
-                    // Hide welcome screen on first message
                     if let Some(wb) = welcome_box_ref.borrow_mut().take() {
                         chat_box_clone.remove(&wb);
                     }
-
                     *current_bot_label.borrow_mut() = None;
                     *current_system_label.borrow_mut() = None;
 
@@ -336,17 +369,31 @@ fn build_ui(app: &Application) {
                         *sys_opt = Some(label);
                     }
                 }
+                UiMessage::ToolUse(name, desc) => {
+                    *current_bot_label.borrow_mut() = None; // Break text stream
+                    let tool_card = GtkBox::new(Orientation::Vertical, 4);
+                    tool_card.add_css_class("tool-card");
+                    
+                    let header = GtkBox::new(Orientation::Horizontal, 8);
+                    let icon = Image::from_icon_name("applications-engineering-symbolic");
+                    let title = Label::builder().label(&format!("🛠️ Executed Tool: {}", name)).xalign(0.0).css_classes(["tool-header"]).build();
+                    header.append(&icon);
+                    header.append(&title);
+                    
+                    let body = Label::builder().label(&desc).wrap(true).xalign(0.0).css_classes(["tool-desc"]).build();
+                    
+                    tool_card.append(&header);
+                    tool_card.append(&body);
+                    chat_box_clone.append(&tool_card);
+                }
                 UiMessage::EngineOutput(m) => {
                     let mut bot_opt = current_bot_label.borrow_mut();
                     if bot_opt.is_none() {
                         let container = GtkBox::builder().css_classes(["bot-bubble"]).orientation(Orientation::Horizontal).halign(Align::Fill).build();
-                        
                         let bot_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(24).css_classes(["bot-icon"]).valign(Align::Start).build();
                         let label = Label::builder().label(&m).wrap(true).xalign(0.0).selectable(true).hexpand(true).build();
-                        
                         container.append(&bot_icon);
                         container.append(&label);
-                        
                         chat_box_clone.append(&container);
                         *bot_opt = Some(label);
                     } else {
@@ -365,7 +412,6 @@ fn build_ui(app: &Application) {
                     }
                 }
             }
-
             let adjustment = scroll_window_clone.vadjustment();
             adjustment.set_value(adjustment.upper());
         }
@@ -380,6 +426,23 @@ fn build_ui(app: &Application) {
             .unwrap();
 
         rt.block_on(async move {
+            // Load sessions asynchronously on startup
+            if let Ok(output) = Command::new("gemini").arg("--list-sessions").output().await {
+                let out_str = String::from_utf8_lossy(&output.stdout);
+                let mut sessions = vec![];
+                for line in out_str.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(char::is_numeric) {
+                        if let Some(session_text) = trimmed.split("] ").last() {
+                            sessions.push(session_text.to_string());
+                        } else {
+                            sessions.push(trimmed.to_string());
+                        }
+                    }
+                }
+                ui_sender_clone.send(UiMessage::SessionsLoaded(sessions)).await.unwrap();
+            }
+
             while let Some((prompt, cwd, yolo)) = async_receiver.recv().await {
                 ui_sender_clone.send(UiMessage::SystemMessage("Thinking...".to_string())).await.unwrap();
 
@@ -414,6 +477,10 @@ fn build_ui(app: &Application) {
                             if let Some(txt) = parsed.content {
                                 ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap();
                             }
+                        } else if parsed.msg_type.as_deref() == Some("tool_use") {
+                            let name = parsed.tool_name.unwrap_or_else(|| "Unknown".to_string());
+                            let desc = parsed.parameters.map(|p| p.to_string()).unwrap_or_default();
+                            ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
                         } else if parsed.msg_type.as_deref() == Some("result") && parsed.status.as_deref() == Some("error") {
                             if let Some(err) = parsed.error {
                                 ui_sender_clone.send(UiMessage::Error(err)).await.unwrap();
