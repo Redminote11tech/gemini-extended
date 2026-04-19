@@ -33,51 +33,100 @@ fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         "
-        .chat-view {
-            background-color: @view_bg_color;
+        .material-window {
+            background-color: @window_bg_color;
         }
+        .material-header {
+            background: transparent;
+            border-bottom: none;
+            box-shadow: none;
+        }
+        .material-chat-view {
+            background-color: transparent;
+        }
+        
+        /* Chat Bubbles */
         .user-bubble { 
             background-color: @accent_bg_color; 
             color: @accent_fg_color; 
-            border-radius: 18px 18px 0px 18px; 
-            padding: 10px 16px; 
-            margin-bottom: 8px; 
-            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            border-radius: 20px 20px 4px 20px; 
+            padding: 12px 18px; 
+            margin: 16px 0px 8px 0px; 
+            font-size: 1.05em;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
         }
         .bot-bubble { 
-            background-color: @card_bg_color; 
-            color: @card_fg_color; 
-            border-radius: 18px 18px 18px 0px; 
-            padding: 10px 16px; 
-            margin-bottom: 8px; 
-            border: 1px solid @card_shade_color;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            background-color: transparent; 
+            color: @window_fg_color; 
+            padding: 4px 0px; 
+            margin: 8px 0px 16px 0px; 
+            font-size: 1.05em;
+            line-height: 1.6;
+        }
+        .bot-icon {
+            color: @accent_bg_color;
+            margin-right: 16px;
+            margin-top: 4px;
         }
         .system-bubble { 
             color: @dim_label_color; 
             font-style: italic; 
             font-size: 0.9em;
-            margin-bottom: 6px;
-            margin-top: 6px;
+            margin: 8px 0;
         }
-        .input-bar {
-            background-color: @window_bg_color;
-            border-top: 1px solid @border_color;
-            padding: 12px 24px 24px 24px;
+
+        /* Material Input Bar */
+        .material-input-container {
+            background: transparent;
+            padding: 12px 24px 32px 24px;
         }
-        .pill-entry {
-            border-radius: 24px;
-            padding: 4px 12px;
+        .material-search-bar {
+            background-color: @card_bg_color;
+            border-radius: 32px;
+            padding: 6px 6px 6px 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border: 1px solid @window_bg_color;
         }
-        .send-btn {
+        .material-entry {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            font-size: 1.1em;
+        }
+        .material-entry:focus {
+            outline: none;
+            box-shadow: none;
+        }
+        .material-send-btn {
             border-radius: 50%;
-            min-width: 36px;
-            min-height: 36px;
+            background-color: @accent_bg_color;
+            color: @accent_fg_color;
+            min-width: 44px;
+            min-height: 44px;
             padding: 0;
+            margin-left: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            transition: all 0.2s ease;
+        }
+        .material-send-btn:hover {
+            background-image: image(rgba(255,255,255,0.1));
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
         }
         .workspace-btn {
             border-radius: 18px;
             font-weight: bold;
+            background-color: @card_bg_color;
+        }
+        .welcome-title {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: @window_fg_color;
+            margin-top: 16px;
+        }
+        .welcome-subtitle {
+            font-size: 1.2em;
+            color: @dim_label_color;
+            margin-top: 8px;
         }
         "
     );
@@ -91,15 +140,19 @@ fn load_css() {
 fn build_ui(app: &Application) {
     load_css();
 
+    // Default System Theme (Follow OS settings automatically)
+    StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Gemini Extended")
-        .default_width(900)
-        .default_height(750)
+        .default_width(950)
+        .default_height(800)
+        .css_classes(["material-window"])
         .build();
 
     let toolbar_view = ToolbarView::builder().build();
-    let header_bar = HeaderBar::builder().build();
+    let header_bar = HeaderBar::builder().css_classes(["material-header"]).build();
     toolbar_view.add_top_bar(&header_bar);
 
     // --- State Variables ---
@@ -139,13 +192,13 @@ fn build_ui(app: &Application) {
                 if let Some(path) = folder.path() {
                     *current_dir_clone.borrow_mut() = path.clone();
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    dir_label_clone.set_label(&name);
+                    dir_label_clone.set_label(&*name);
                 }
             }
         });
     });
 
-    // --- Header: Settings Menu ---
+    // --- Header: Settings Menu (YOLO Mode Only, System Theme is auto) ---
     let settings_menu = MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("Settings & Permissions")
@@ -153,31 +206,14 @@ fn build_ui(app: &Application) {
     
     let popover = Popover::builder().build();
     let popover_box = GtkBox::new(Orientation::Vertical, 12);
-    popover_box.set_margin_start(12);
-    popover_box.set_margin_end(12);
-    popover_box.set_margin_top(12);
-    popover_box.set_margin_bottom(12);
+    popover_box.set_margin_start(16);
+    popover_box.set_margin_end(16);
+    popover_box.set_margin_top(16);
+    popover_box.set_margin_bottom(16);
 
-    // Dark Mode Toggle
-    let theme_box = GtkBox::new(Orientation::Horizontal, 12);
-    let theme_label = Label::builder().label("Dark Mode").hexpand(true).xalign(0.0).build();
-    let theme_switch = Switch::new();
-    theme_switch.set_active(StyleManager::default().is_dark());
-    theme_switch.connect_state_set(|_, state| {
-        let manager = StyleManager::default();
-        if state {
-            manager.set_color_scheme(adw::ColorScheme::ForceDark);
-        } else {
-            manager.set_color_scheme(adw::ColorScheme::ForceLight);
-        }
-        glib::Propagation::Proceed
-    });
-    theme_box.append(&theme_label);
-    theme_box.append(&theme_switch);
-
-    // YOLO Mode (Permissions) Toggle
+    // YOLO Mode Toggle
     let yolo_box = GtkBox::new(Orientation::Horizontal, 12);
-    let yolo_label = Label::builder().label("Auto-Approve (YOLO)").hexpand(true).xalign(0.0).build();
+    let yolo_label = Label::builder().label("<b>Auto-Approve (YOLO)</b>").use_markup(true).hexpand(true).xalign(0.0).build();
     let yolo_switch = Switch::new();
     let yolo_mode_clone = yolo_mode.clone();
     yolo_switch.connect_state_set(move |_, state| {
@@ -187,7 +223,6 @@ fn build_ui(app: &Application) {
     yolo_box.append(&yolo_label);
     yolo_box.append(&yolo_switch);
 
-    popover_box.append(&theme_box);
     popover_box.append(&yolo_box);
     popover.set_child(Some(&popover_box));
     settings_menu.set_popover(Some(&popover));
@@ -198,39 +233,58 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .vexpand(true)
         .hscrollbar_policy(gtk4::PolicyType::Never)
-        .css_classes(["chat-view"])
+        .css_classes(["material-chat-view"])
         .build();
 
-    let clamp_chat = Clamp::builder().maximum_size(750).build();
+    let clamp_chat = Clamp::builder().maximum_size(850).build();
     
     let chat_box = GtkBox::new(Orientation::Vertical, 12);
-    chat_box.set_margin_top(24);
-    chat_box.set_margin_bottom(24);
-    chat_box.set_margin_start(16);
-    chat_box.set_margin_end(16);
+    chat_box.set_margin_top(32);
+    chat_box.set_margin_bottom(32);
+    chat_box.set_margin_start(24);
+    chat_box.set_margin_end(24);
     
+    // Welcome Screen / Empty State
+    let welcome_box = GtkBox::new(Orientation::Vertical, 0);
+    welcome_box.set_valign(Align::Center);
+    welcome_box.set_vexpand(true);
+    
+    let welcome_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(80).build();
+    welcome_icon.add_css_class("accent");
+    
+    let welcome_title = Label::builder().label("Hello, I'm Gemini").css_classes(["welcome-title"]).build();
+    let welcome_subtitle = Label::builder().label("How can I help you today?").css_classes(["welcome-subtitle"]).build();
+    
+    welcome_box.append(&welcome_icon);
+    welcome_box.append(&welcome_title);
+    welcome_box.append(&welcome_subtitle);
+    
+    chat_box.append(&welcome_box);
+
     clamp_chat.set_child(Some(&chat_box));
     scroll_window.set_child(Some(&clamp_chat));
     
     let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.append(&scroll_window);
 
-    // --- Input Area ---
+    // --- Input Area (Material Search Bar) ---
     let input_container = GtkBox::new(Orientation::Vertical, 0);
-    input_container.add_css_class("input-bar");
+    input_container.add_css_class("material-input-container");
 
-    let clamp_input = Clamp::builder().maximum_size(750).build();
-    let input_box = GtkBox::new(Orientation::Horizontal, 8);
+    let clamp_input = Clamp::builder().maximum_size(850).build();
+    
+    let input_box = GtkBox::new(Orientation::Horizontal, 0);
+    input_box.add_css_class("material-search-bar");
     
     let prompt_entry = Entry::builder()
         .placeholder_text("Ask Gemini to write code, analyze files, or fix bugs...")
         .hexpand(true)
-        .css_classes(["pill-entry"])
+        .css_classes(["flat", "material-entry"])
         .build();
     
     let send_button = Button::builder()
         .icon_name("send-symbolic")
-        .css_classes(["suggested-action", "send-btn"])
+        .css_classes(["material-send-btn"])
         .tooltip_text("Send prompt")
         .build();
 
@@ -245,7 +299,6 @@ fn build_ui(app: &Application) {
 
     // --- Channels & IPC ---
     let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
-    // Passing: (Prompt, Working Directory, YOLO Mode)
     let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool)>(32);
 
     let chat_box_clone = chat_box.clone();
@@ -253,12 +306,18 @@ fn build_ui(app: &Application) {
     
     let current_bot_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
     let current_system_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
+    let welcome_box_ref = Rc::new(RefCell::new(Some(welcome_box)));
 
     // --- UI Update Loop (GTK Thread) ---
     glib::spawn_future_local(async move {
         while let Some(msg) = ui_receiver.recv().await {
             match msg {
                 UiMessage::NewUserMessage(m) => {
+                    // Hide welcome screen on first message
+                    if let Some(wb) = welcome_box_ref.borrow_mut().take() {
+                        chat_box_clone.remove(&wb);
+                    }
+
                     *current_bot_label.borrow_mut() = None;
                     *current_system_label.borrow_mut() = None;
 
@@ -280,10 +339,15 @@ fn build_ui(app: &Application) {
                 UiMessage::EngineOutput(m) => {
                     let mut bot_opt = current_bot_label.borrow_mut();
                     if bot_opt.is_none() {
-                        let label = Label::builder().label(&m).wrap(true).xalign(0.0).selectable(true).build();
-                        let bubble = GtkBox::builder().css_classes(["bot-bubble"]).halign(Align::Start).build();
-                        bubble.append(&label);
-                        chat_box_clone.append(&bubble);
+                        let container = GtkBox::builder().css_classes(["bot-bubble"]).orientation(Orientation::Horizontal).halign(Align::Fill).build();
+                        
+                        let bot_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(24).css_classes(["bot-icon"]).valign(Align::Start).build();
+                        let label = Label::builder().label(&m).wrap(true).xalign(0.0).selectable(true).hexpand(true).build();
+                        
+                        container.append(&bot_icon);
+                        container.append(&label);
+                        
+                        chat_box_clone.append(&container);
                         *bot_opt = Some(label);
                     } else {
                         let lbl = bot_opt.as_ref().unwrap();
@@ -328,7 +392,6 @@ fn build_ui(app: &Application) {
                    .stdout(Stdio::piped())
                    .stderr(Stdio::piped());
 
-                // Inject Permissions logic!
                 if yolo {
                     cmd.arg("-y");
                 }
