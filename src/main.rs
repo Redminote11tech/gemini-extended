@@ -22,6 +22,12 @@ pub enum UiMessage {
     ClearChat,
 }
 
+pub enum AsyncRequest {
+    Prompt { text: String, cwd: PathBuf, yolo: bool, session_id: Option<String> },
+    LoadHistory { session_id: String },
+    RefreshSessions { cwd: PathBuf },
+}
+
 #[derive(Deserialize, Debug)]
 struct RawStream {
     #[serde(rename = "type")]
@@ -180,6 +186,19 @@ fn build_ui(app: &Application) {
     let yolo_mode = Rc::new(RefCell::new(false));
     let active_session: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
+    // --- IPC ---
+    let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
+    let (async_sender, mut async_receiver) = mpsc::channel::<AsyncRequest>(32);
+
+    // Initial session load
+    let async_sender_init = async_sender.clone();
+    let current_dir_init = current_dir.borrow().clone();
+    glib::spawn_future_local(async move {
+        if let Err(e) = async_sender_init.send(AsyncRequest::RefreshSessions { cwd: current_dir_init }).await {
+            eprintln!("Failed to request initial sessions: {}", e);
+        }
+    });
+
     // --- SIDEBAR ---
     let sidebar_box = GtkBox::new(Orientation::Vertical, 0);
     sidebar_box.add_css_class("sidebar");
@@ -221,16 +240,25 @@ fn build_ui(app: &Application) {
     let window_clone = window.clone();
     let current_dir_clone = current_dir.clone();
     let dir_label_clone = dir_label.clone();
+    let async_sender_dir = async_sender.clone();
     dir_button.connect_clicked(move |_| {
         let dialog = FileDialog::builder().title("Select Workspace").build();
         let cd_clone = current_dir_clone.clone();
         let dl_clone = dir_label_clone.clone();
+        let sender = async_sender_dir.clone();
         dialog.select_folder(Some(&window_clone), gtk4::gio::Cancellable::NONE, move |result| {
             if let Ok(folder) = result {
                 if let Some(path) = folder.path() {
                     *cd_clone.borrow_mut() = path.clone();
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     dl_clone.set_label(&name);
+                    
+                    let p = path.clone();
+                    glib::spawn_future_local(async move {
+                        if let Err(e) = sender.send(AsyncRequest::RefreshSessions { cwd: p }).await {
+                            eprintln!("Failed to refresh sessions: {}", e);
+                        }
+                    });
                 }
             }
         });
@@ -329,21 +357,14 @@ fn build_ui(app: &Application) {
     content_toolbar_view.set_content(Some(&main_box)); paned.set_end_child(Some(&content_toolbar_view));
     paned.set_position(280); window.set_content(Some(&paned));
 
-    // --- IPC ---
-    let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
-    // Request channel: Prompt, CWD, YOLO, SessionID, is_history_request
-    let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool, Option<String>, bool)>(32);
-
     let chat_box_clone = chat_box.clone();
     let scroll_window_clone = scroll_window.clone();
     let sessions_list_clone = sessions_list.clone();
-    let loading_row_clone = loading_row.clone();
     let welcome_box_clone = welcome_box.clone();
     
     let current_bot_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
     let current_system_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
 
-    // Clear Chat Closure
     let clear_chat = Rc::new({
         let chat_box_for_clear = chat_box.clone();
         let welcome_box_for_clear = welcome_box.clone();
@@ -372,7 +393,6 @@ fn build_ui(app: &Application) {
     let clear_chat_row = clear_chat.clone();
     let welcome_box_row = welcome_box.clone();
     let async_sender_row = async_sender.clone();
-    let current_dir_row = current_dir.clone();
     
     sessions_list.connect_row_activated(move |_, row| {
         if let Some(child) = row.first_child() {
@@ -386,10 +406,8 @@ fn build_ui(app: &Application) {
                         welcome_box_row.set_visible(false);
                         
                         let sender = async_sender_row.clone();
-                        let cwd = current_dir_row.borrow().clone();
                         glib::spawn_future_local(async move {
-                            // Send a request to Tokio to just load and parse this history file!
-                            if let Err(e) = sender.send(("".to_string(), cwd, false, Some(id), true)).await {
+                            if let Err(e) = sender.send(AsyncRequest::LoadHistory { session_id: id }).await {
                                 eprintln!("Failed to request history: {}", e);
                             }
                         });
@@ -404,7 +422,13 @@ fn build_ui(app: &Application) {
         while let Some(msg) = ui_receiver.recv().await {
             match msg {
                 UiMessage::SessionsLoaded(sessions) => {
-                    sessions_list_clone.remove(&loading_row_clone);
+                    // Remove all children safely to refresh
+                    let mut child = sessions_list_clone.first_child();
+                    while let Some(c) = child {
+                        let next = c.next_sibling();
+                        sessions_list_clone.remove(&c);
+                        child = next;
+                    }
                     if sessions.is_empty() {
                         let lbl = Label::builder().label("No recent sessions found.").css_classes(["dim-label"]).margin_top(16).build();
                         let row = ListBoxRow::builder().child(&lbl).activatable(false).selectable(false).build();
@@ -493,51 +517,55 @@ fn build_ui(app: &Application) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         rt.block_on(async move {
-            if let Ok(output) = Command::new("gemini").arg("--list-sessions").output().await {
-                let out_str = String::from_utf8_lossy(&output.stdout);
-                let mut sessions = vec![];
-                for line in out_str.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with(char::is_numeric) { sessions.push(trimmed.to_string()); }
-                }
-                ui_sender_clone.send(UiMessage::SessionsLoaded(sessions)).await.unwrap();
-            }
-
-            while let Some((prompt, cwd, yolo, session_id, is_history)) = async_receiver.recv().await {
-                
-                // HISTORY RESTORE LOGIC
-                if is_history {
-                    if let Some(uuid) = session_id {
-                        let short_uuid = uuid.split('-').next().unwrap_or(&uuid);
+            while let Some(req) = async_receiver.recv().await {
+                match req {
+                    AsyncRequest::RefreshSessions { cwd } => {
+                        if let Ok(output) = Command::new("gemini").current_dir(&cwd).arg("--list-sessions").output().await {
+                            let out_str = String::from_utf8_lossy(&output.stdout);
+                            let mut sessions = vec![];
+                            for line in out_str.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.starts_with(char::is_numeric) {
+                                    sessions.push(trimmed.to_string());
+                                }
+                            }
+                            ui_sender_clone.send(UiMessage::SessionsLoaded(sessions)).await.unwrap();
+                        }
+                    }
+                    AsyncRequest::LoadHistory { session_id } => {
+                        let short_uuid = session_id.split('-').next().unwrap_or(&session_id);
                         if let Ok(output) = Command::new("find").arg(dirs::home_dir().unwrap().join(".gemini")).arg("-type").arg("f").arg("-name").arg(format!("*{}*.json", short_uuid)).output().await {
                             let path_str = String::from_utf8_lossy(&output.stdout);
                             if let Some(first_path) = path_str.lines().next() {
-                                if let Ok(contents) = tokio::fs::read_to_string(first_path).await {
-                                    if let Ok(history) = serde_json::from_str::<HistoryFile>(&contents) {
-                                        if let Some(msgs) = history.messages {
-                                            for msg in msgs {
-                                                if msg.msg_type.as_deref() == Some("user") {
-                                                    if let Some(content) = msg.content {
-                                                        if let Some(arr) = content.as_array() {
-                                                            if let Some(obj) = arr.get(0) {
-                                                                if let Some(txt) = obj.get("text").and_then(|t| t.as_str()) {
-                                                                    ui_sender_clone.send(UiMessage::NewUserMessage(txt.to_string())).await.unwrap();
-                                                                }
+                                let clean_path = first_path.trim();
+                                if !clean_path.is_empty() {
+                                    if let Ok(contents) = tokio::fs::read_to_string(clean_path).await {
+                                        if let Ok(history) = serde_json::from_str::<HistoryFile>(&contents) {
+                                            if let Some(msgs) = history.messages {
+                                                for msg in msgs {
+                                                    if msg.msg_type.as_deref() == Some("user") {
+                                                        let txt_opt = if let Some(s) = msg.content.as_ref().and_then(|c| c.as_str()) {
+                                                            Some(s.to_string())
+                                                        } else if let Some(arr) = msg.content.as_ref().and_then(|c| c.as_array()) {
+                                                            arr.first().and_then(|obj| obj.get("text")).and_then(|t| t.as_str()).map(|s| s.to_string())
+                                                        } else { None };
+                                                        
+                                                        if let Some(txt) = txt_opt {
+                                                            ui_sender_clone.send(UiMessage::NewUserMessage(txt)).await.unwrap();
+                                                        }
+                                                    } else if msg.msg_type.as_deref() == Some("gemini") {
+                                                        if let Some(content) = msg.content {
+                                                            if let Some(txt) = content.as_str() {
+                                                                ui_sender_clone.send(UiMessage::EngineOutput(txt.to_string())).await.unwrap();
+                                                                ui_sender_clone.send(UiMessage::Done).await.unwrap();
                                                             }
                                                         }
-                                                    }
-                                                } else if msg.msg_type.as_deref() == Some("gemini") {
-                                                    if let Some(content) = msg.content {
-                                                        if let Some(txt) = content.as_str() {
-                                                            ui_sender_clone.send(UiMessage::EngineOutput(txt.to_string())).await.unwrap();
-                                                            ui_sender_clone.send(UiMessage::Done).await.unwrap(); // flush the bubble
-                                                        }
-                                                    }
-                                                    if let Some(calls) = msg.tool_calls {
-                                                        for call in calls {
-                                                            let name = call.name.unwrap_or_default();
-                                                            let desc = call.args.map(|p| p.to_string()).unwrap_or_default();
-                                                            ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
+                                                        if let Some(calls) = msg.tool_calls {
+                                                            for call in calls {
+                                                                let name = call.name.unwrap_or_default();
+                                                                let desc = call.args.map(|p| p.to_string()).unwrap_or_default();
+                                                                ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -549,46 +577,45 @@ fn build_ui(app: &Application) {
                         }
                         ui_sender_clone.send(UiMessage::SystemMessage("Resumed session.".to_string())).await.unwrap();
                     }
-                    continue; // History loaded, don't spawn gemini yet!
-                }
+                    AsyncRequest::Prompt { text, cwd, yolo, session_id } => {
+                        ui_sender_clone.send(UiMessage::SystemMessage("Thinking...".to_string())).await.unwrap();
 
-                // NORMAL PROMPT EXECUTION
-                ui_sender_clone.send(UiMessage::SystemMessage("Thinking...".to_string())).await.unwrap();
+                        let mut cmd = Command::new("gemini");
+                        cmd.current_dir(&cwd).arg("-p").arg(&text).arg("-o").arg("stream-json")
+                           .stdout(Stdio::piped()).stderr(Stdio::piped());
 
-                let mut cmd = Command::new("gemini");
-                cmd.current_dir(&cwd).arg("-p").arg(&prompt).arg("-o").arg("stream-json")
-                   .stdout(Stdio::piped()).stderr(Stdio::piped());
+                        if yolo { cmd.arg("-y"); }
+                        if let Some(sid) = session_id { cmd.arg("-r").arg(&sid); }
 
-                if yolo { cmd.arg("-y"); }
-                if let Some(sid) = session_id { cmd.arg("-r").arg(&sid); }
+                        let mut child = match cmd.spawn() {
+                            Ok(child) => child,
+                            Err(e) => {
+                                ui_sender_clone.send(UiMessage::Error(format!("Failed to spawn CLI: {}", e))).await.unwrap();
+                                ui_sender_clone.send(UiMessage::Done).await.unwrap();
+                                continue;
+                            }
+                        };
 
-                let mut child = match cmd.spawn() {
-                    Ok(child) => child,
-                    Err(e) => {
-                        ui_sender_clone.send(UiMessage::Error(format!("Failed to spawn CLI: {}", e))).await.unwrap();
-                        ui_sender_clone.send(UiMessage::Done).await.unwrap();
-                        continue;
-                    }
-                };
+                        let stdout = child.stdout.take().expect("Failed to grab stdout");
+                        let mut reader = BufReader::new(stdout).lines();
 
-                let stdout = child.stdout.take().expect("Failed to grab stdout");
-                let mut reader = BufReader::new(stdout).lines();
-
-                while let Ok(Some(line)) = reader.next_line().await {
-                    if let Ok(parsed) = serde_json::from_str::<RawStream>(&line) {
-                        if parsed.msg_type.as_deref() == Some("message") && parsed.role.as_deref() == Some("assistant") {
-                            if let Some(txt) = parsed.content { ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap(); }
-                        } else if parsed.msg_type.as_deref() == Some("tool_use") {
-                            let name = parsed.tool_name.unwrap_or_else(|| "Unknown".to_string());
-                            let desc = parsed.parameters.map(|p| p.to_string()).unwrap_or_default();
-                            ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
-                        } else if parsed.msg_type.as_deref() == Some("result") && parsed.status.as_deref() == Some("error") {
-                            if let Some(err) = parsed.error { ui_sender_clone.send(UiMessage::Error(err)).await.unwrap(); }
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Ok(parsed) = serde_json::from_str::<RawStream>(&line) {
+                                if parsed.msg_type.as_deref() == Some("message") && parsed.role.as_deref() == Some("assistant") {
+                                    if let Some(txt) = parsed.content { ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap(); }
+                                } else if parsed.msg_type.as_deref() == Some("tool_use") {
+                                    let name = parsed.tool_name.unwrap_or_else(|| "Unknown".to_string());
+                                    let desc = parsed.parameters.map(|p| p.to_string()).unwrap_or_default();
+                                    ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
+                                } else if parsed.msg_type.as_deref() == Some("result") && parsed.status.as_deref() == Some("error") {
+                                    if let Some(err) = parsed.error { ui_sender_clone.send(UiMessage::Error(err)).await.unwrap(); }
+                                }
+                            }
                         }
+                        
+                        ui_sender_clone.send(UiMessage::Done).await.unwrap();
                     }
                 }
-                
-                ui_sender_clone.send(UiMessage::Done).await.unwrap();
             }
         });
     });
@@ -612,7 +639,7 @@ fn build_ui(app: &Application) {
             
             glib::spawn_future_local(async move {
                 ui_sender_local.send(UiMessage::NewUserMessage(text.clone())).await.unwrap();
-                if let Err(e) = async_sender_local.send((text, cwd, yolo, session, false)).await {
+                if let Err(e) = async_sender_local.send(AsyncRequest::Prompt { text, cwd, yolo, session_id: session }).await {
                     eprintln!("Failed to send to async runtime: {}", e);
                 }
             });
