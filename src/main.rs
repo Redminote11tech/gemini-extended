@@ -34,6 +34,26 @@ struct RawStream {
     parameters: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize, Debug)]
+struct HistoryFile {
+    messages: Option<Vec<HistoryMessage>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HistoryMessage {
+    #[serde(rename = "type")]
+    msg_type: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(rename = "toolCalls")]
+    tool_calls: Option<Vec<HistoryToolCall>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HistoryToolCall {
+    name: Option<String>,
+    args: Option<serde_json::Value>,
+}
+
 fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
@@ -121,13 +141,14 @@ fn load_css() {
             border-radius: 50%;
             padding: 0;
             margin: 0 6px;
-            border: 2px solid transparent;
+            border: 3px solid transparent;
             box-shadow: 0 2px 4px rgba(0,0,0,0.15);
         }
         .color-swatch:hover { opacity: 0.8; }
         .swatch-blue { background-color: #3584e4; }
         .swatch-green { background-color: #2ec27e; }
         .swatch-purple { background-color: #813d9c; }
+        .swatch-selected { border-color: @window_fg_color; }
 
         .theme-blue { @define-color accent_color #3584e4; @define-color accent_bg_color #3584e4; @define-color accent_fg_color #ffffff; }
         .theme-green { @define-color accent_color #2ec27e; @define-color accent_bg_color #2ec27e; @define-color accent_fg_color #ffffff; }
@@ -155,60 +176,44 @@ fn build_ui(app: &Application) {
 
     let paned = Paned::builder().orientation(Orientation::Horizontal).hexpand(true).vexpand(true).build();
 
-    // --- State Variables ---
     let current_dir = Rc::new(RefCell::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))));
     let yolo_mode = Rc::new(RefCell::new(false));
     let active_session: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-    // --- SIDEBAR (Sessions) ---
+    // --- SIDEBAR ---
     let sidebar_box = GtkBox::new(Orientation::Vertical, 0);
     sidebar_box.add_css_class("sidebar");
     sidebar_box.set_size_request(280, -1);
-    
     let sidebar_header = HeaderBar::builder().show_end_title_buttons(false).build();
     sidebar_box.append(&sidebar_header);
 
-    let new_chat_btn = Button::builder()
-        .label("New Chat")
-        .css_classes(["suggested-action", "pill"])
-        .margin_top(12).margin_bottom(12).margin_start(16).margin_end(16)
-        .build();
+    let new_chat_btn = Button::builder().label("New Chat").css_classes(["suggested-action", "pill"])
+        .margin_top(12).margin_bottom(12).margin_start(16).margin_end(16).build();
     sidebar_box.append(&new_chat_btn);
 
     let sessions_scroll = ScrolledWindow::builder().hexpand(true).vexpand(true).build();
-    let sessions_list = ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::Single)
-        .css_classes(["navigation-sidebar"])
-        .build();
-    
-    // Add loading placeholder (unselectable)
+    let sessions_list = ListBox::builder().selection_mode(gtk4::SelectionMode::Single).css_classes(["navigation-sidebar"]).build();
     let loading_label = Label::builder().label("Loading sessions...").css_classes(["dim-label"]).margin_top(16).build();
-    let loading_row = ListBoxRow::builder()
-        .child(&loading_label)
-        .activatable(false)
-        .selectable(false)
-        .build();
+    let loading_row = ListBoxRow::builder().child(&loading_label).activatable(false).selectable(false).build();
     sessions_list.append(&loading_row);
-    
     sessions_scroll.set_child(Some(&sessions_list));
     sidebar_box.append(&sessions_scroll);
     paned.set_start_child(Some(&sidebar_box));
 
-    // --- MAIN CONTENT AREA ---
+    // --- MAIN CONTENT ---
     let content_toolbar_view = ToolbarView::builder().hexpand(true).vexpand(true).build();
     let header_bar = HeaderBar::builder().css_classes(["material-header"]).build();
     content_toolbar_view.add_top_bar(&header_bar);
 
-    // Workspace Button
+    // Workspace
     let workspace_box = GtkBox::new(Orientation::Horizontal, 6);
     workspace_box.set_halign(Align::Center);
-    let dir_button = Button::builder().css_classes(["workspace-btn", "flat"]).tooltip_text("Change contained directory").build();
+    let dir_button = Button::builder().css_classes(["workspace-btn", "flat"]).tooltip_text("Change directory").build();
     let folder_name = current_dir.borrow().file_name().unwrap_or_default().to_string_lossy().to_string();
     let btn_content = GtkBox::new(Orientation::Horizontal, 6);
     let folder_icon = Image::from_icon_name("folder-open-symbolic");
     let dir_label = Label::builder().label(&folder_name).build();
-    btn_content.append(&folder_icon);
-    btn_content.append(&dir_label);
+    btn_content.append(&folder_icon); btn_content.append(&dir_label);
     dir_button.set_child(Some(&btn_content));
     workspace_box.append(&dir_button);
     header_bar.set_title_widget(Some(&workspace_box));
@@ -217,91 +222,94 @@ fn build_ui(app: &Application) {
     let current_dir_clone = current_dir.clone();
     let dir_label_clone = dir_label.clone();
     dir_button.connect_clicked(move |_| {
-        let dialog = FileDialog::builder().title("Select Workspace Directory").build();
-        let current_dir_clone = current_dir_clone.clone();
-        let dir_label_clone = dir_label_clone.clone();
+        let dialog = FileDialog::builder().title("Select Workspace").build();
+        let cd_clone = current_dir_clone.clone();
+        let dl_clone = dir_label_clone.clone();
         dialog.select_folder(Some(&window_clone), gtk4::gio::Cancellable::NONE, move |result| {
             if let Ok(folder) = result {
                 if let Some(path) = folder.path() {
-                    *current_dir_clone.borrow_mut() = path.clone();
+                    *cd_clone.borrow_mut() = path.clone();
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    dir_label_clone.set_label(&name);
+                    dl_clone.set_label(&name);
                 }
             }
         });
     });
 
-    // Settings Menu
+    // Settings
     let settings_menu = MenuButton::builder().icon_name("open-menu-symbolic").tooltip_text("Settings & Theme").build();
     let popover = Popover::builder().build();
     let popover_box = GtkBox::new(Orientation::Vertical, 12);
     popover_box.set_margin_start(16); popover_box.set_margin_end(16); popover_box.set_margin_top(16); popover_box.set_margin_bottom(16);
 
-    // YOLO Toggle
     let yolo_box = GtkBox::new(Orientation::Horizontal, 12);
     let yolo_label = Label::builder().label("<b>Auto-Approve (YOLO)</b>").use_markup(true).hexpand(true).xalign(0.0).build();
     let yolo_switch = Switch::new();
     let yolo_mode_clone = yolo_mode.clone();
-    yolo_switch.connect_state_set(move |_, state| {
-        *yolo_mode_clone.borrow_mut() = state;
-        glib::Propagation::Proceed
-    });
-    yolo_box.append(&yolo_label);
-    yolo_box.append(&yolo_switch);
+    yolo_switch.connect_state_set(move |_, state| { *yolo_mode_clone.borrow_mut() = state; glib::Propagation::Proceed });
+    yolo_box.append(&yolo_label); yolo_box.append(&yolo_switch);
     popover_box.append(&yolo_box);
 
-    // Accent Color Row (Fixed Swatches, No Tick)
     let theme_box = GtkBox::new(Orientation::Horizontal, 12);
     theme_box.set_margin_top(8);
     let theme_label = Label::builder().label("Accent Color").hexpand(true).xalign(0.0).build();
     theme_box.append(&theme_label);
     
-    let btn_blue = Button::builder().css_classes(["color-swatch", "swatch-blue"]).build();
+    let btn_blue = Button::builder().css_classes(["color-swatch", "swatch-blue", "swatch-selected"]).build();
     let btn_green = Button::builder().css_classes(["color-swatch", "swatch-green"]).build();
     let btn_purple = Button::builder().css_classes(["color-swatch", "swatch-purple"]).build();
     
     let window_theme_clone = window.clone();
-    btn_blue.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-blue"]); });
-    let window_theme_clone = window.clone();
-    btn_green.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-green"]); });
-    let window_theme_clone = window.clone();
-    btn_purple.connect_clicked(move |_| { window_theme_clone.set_css_classes(&["material-window", "theme-purple"]); });
+    let btn_blue_clone = btn_blue.clone();
+    let btn_green_clone = btn_green.clone();
+    let btn_purple_clone = btn_purple.clone();
+    btn_blue.connect_clicked(move |btn| {
+        window_theme_clone.set_css_classes(&["material-window", "theme-blue"]);
+        btn.add_css_class("swatch-selected"); btn_green_clone.remove_css_class("swatch-selected"); btn_purple_clone.remove_css_class("swatch-selected");
+    });
     
-    theme_box.append(&btn_blue);
-    theme_box.append(&btn_green);
-    theme_box.append(&btn_purple);
+    let window_theme_clone = window.clone();
+    let btn_blue_clone = btn_blue.clone();
+    let btn_green_clone = btn_green.clone();
+    let btn_purple_clone = btn_purple.clone();
+    btn_green.connect_clicked(move |btn| {
+        window_theme_clone.set_css_classes(&["material-window", "theme-green"]);
+        btn.add_css_class("swatch-selected"); btn_blue_clone.remove_css_class("swatch-selected"); btn_purple_clone.remove_css_class("swatch-selected");
+    });
+    
+    let window_theme_clone = window.clone();
+    let btn_blue_clone = btn_blue.clone();
+    let btn_green_clone = btn_green.clone();
+    let btn_purple_clone = btn_purple.clone();
+    btn_purple.connect_clicked(move |btn| {
+        window_theme_clone.set_css_classes(&["material-window", "theme-purple"]);
+        btn.add_css_class("swatch-selected"); btn_blue_clone.remove_css_class("swatch-selected"); btn_green_clone.remove_css_class("swatch-selected");
+    });
+    
+    theme_box.append(&btn_blue); theme_box.append(&btn_green); theme_box.append(&btn_purple);
     popover_box.append(&theme_box);
-
     popover.set_child(Some(&popover_box));
     settings_menu.set_popover(Some(&popover));
     header_bar.pack_end(&settings_menu);
 
     // Chat View
-    let scroll_window = ScrolledWindow::builder()
-        .hexpand(true).vexpand(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .css_classes(["material-chat-view"])
-        .build();
-
+    let scroll_window = ScrolledWindow::builder().hexpand(true).vexpand(true).hscrollbar_policy(gtk4::PolicyType::Never).css_classes(["material-chat-view"]).build();
     let clamp_chat = Clamp::builder().maximum_size(850).build();
     let chat_box = GtkBox::new(Orientation::Vertical, 12);
     chat_box.set_margin_top(32); chat_box.set_margin_bottom(32); chat_box.set_margin_start(24); chat_box.set_margin_end(24);
     
-    // Welcome Screen
+    // Welcome
     let welcome_box = GtkBox::new(Orientation::Vertical, 0);
     welcome_box.set_valign(Align::Center); welcome_box.set_vexpand(true);
     let welcome_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(80).build();
     welcome_icon.add_css_class("accent");
     let welcome_title = Label::builder().label("Hello, I'm Gemini").css_classes(["welcome-title"]).build();
     let welcome_subtitle = Label::builder().label("How can I help you today?").css_classes(["welcome-subtitle"]).build();
-    welcome_box.append(&welcome_icon);
-    welcome_box.append(&welcome_title);
-    welcome_box.append(&welcome_subtitle);
+    welcome_box.append(&welcome_icon); welcome_box.append(&welcome_title); welcome_box.append(&welcome_subtitle);
     chat_box.append(&welcome_box);
 
     clamp_chat.set_child(Some(&chat_box));
     scroll_window.set_child(Some(&clamp_chat));
-    
     let main_box = GtkBox::new(Orientation::Vertical, 0);
     main_box.append(&scroll_window);
 
@@ -312,34 +320,19 @@ fn build_ui(app: &Application) {
     let input_box = GtkBox::new(Orientation::Horizontal, 0);
     input_box.add_css_class("material-search-bar");
     
-    let prompt_entry = Entry::builder()
-        .placeholder_text("Ask Gemini to write code, analyze files, or fix bugs...")
-        .hexpand(true)
-        .css_classes(["flat", "material-entry"])
-        .build();
-    
-    let send_button = Button::builder()
-        .icon_name("go-up-symbolic")
-        .css_classes(["material-send-btn"])
-        .tooltip_text("Send prompt")
-        .build();
+    let prompt_entry = Entry::builder().placeholder_text("Ask Gemini...").hexpand(true).css_classes(["flat", "material-entry"]).build();
+    let send_button = Button::builder().icon_name("go-up-symbolic").css_classes(["material-send-btn"]).tooltip_text("Send prompt").build();
 
-    input_box.append(&prompt_entry);
-    input_box.append(&send_button);
-    clamp_input.set_child(Some(&input_box));
-    input_container.append(&clamp_input);
-    main_box.append(&input_container);
+    input_box.append(&prompt_entry); input_box.append(&send_button);
+    clamp_input.set_child(Some(&input_box)); input_container.append(&clamp_input); main_box.append(&input_container);
 
-    content_toolbar_view.set_content(Some(&main_box));
-    paned.set_end_child(Some(&content_toolbar_view));
-    
-    // Default ratio
-    paned.set_position(280);
-    window.set_content(Some(&paned));
+    content_toolbar_view.set_content(Some(&main_box)); paned.set_end_child(Some(&content_toolbar_view));
+    paned.set_position(280); window.set_content(Some(&paned));
 
-    // --- Channels & IPC ---
+    // --- IPC ---
     let (ui_sender, mut ui_receiver) = mpsc::channel::<UiMessage>(100);
-    let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool, Option<String>)>(32);
+    // Request channel: Prompt, CWD, YOLO, SessionID, is_history_request
+    let (async_sender, mut async_receiver) = mpsc::channel::<(String, PathBuf, bool, Option<String>, bool)>(32);
 
     let chat_box_clone = chat_box.clone();
     let scroll_window_clone = scroll_window.clone();
@@ -350,8 +343,7 @@ fn build_ui(app: &Application) {
     let current_bot_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
     let current_system_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
 
-    // --- Interaction Closures ---
-    
+    // Clear Chat Closure
     let clear_chat = Rc::new({
         let chat_box_for_clear = chat_box.clone();
         let welcome_box_for_clear = welcome_box.clone();
@@ -359,29 +351,28 @@ fn build_ui(app: &Application) {
             let mut child = chat_box_for_clear.first_child();
             while let Some(c) = child {
                 let next = c.next_sibling();
-                if c != welcome_box_for_clear {
-                    chat_box_for_clear.remove(&c);
-                }
+                if c != welcome_box_for_clear { chat_box_for_clear.remove(&c); }
                 child = next;
             }
         }
     });
 
-    // New Chat Button Handler
     let active_session_nc = active_session.clone();
     let clear_chat_nc = clear_chat.clone();
     let welcome_box_nc = welcome_box.clone();
+    let sessions_list_deselect = sessions_list.clone();
     new_chat_btn.connect_clicked(move |_| {
         *active_session_nc.borrow_mut() = None;
+        sessions_list_deselect.unselect_all();
         clear_chat_nc();
         welcome_box_nc.set_visible(true);
     });
 
-    // Session Select Handler
     let active_session_row = active_session.clone();
     let clear_chat_row = clear_chat.clone();
     let welcome_box_row = welcome_box.clone();
-    let ui_sender_row = ui_sender.clone();
+    let async_sender_row = async_sender.clone();
+    let current_dir_row = current_dir.clone();
     
     sessions_list.connect_row_activated(move |_, row| {
         if let Some(child) = row.first_child() {
@@ -390,14 +381,17 @@ fn build_ui(app: &Application) {
                 if let Some(start) = text.rfind('[') {
                     if let Some(end) = text.rfind(']') {
                         let id = text[start+1..end].to_string();
-                        *active_session_row.borrow_mut() = Some(id);
-                        
+                        *active_session_row.borrow_mut() = Some(id.clone());
                         clear_chat_row();
                         welcome_box_row.set_visible(false);
                         
-                        let sender = ui_sender_row.clone();
+                        let sender = async_sender_row.clone();
+                        let cwd = current_dir_row.borrow().clone();
                         glib::spawn_future_local(async move {
-                            sender.send(UiMessage::SystemMessage(format!("Resumed session. Type a message to continue this conversation..."))).await.unwrap();
+                            // Send a request to Tokio to just load and parse this history file!
+                            if let Err(e) = sender.send(("".to_string(), cwd, false, Some(id), true)).await {
+                                eprintln!("Failed to request history: {}", e);
+                            }
                         });
                     }
                 }
@@ -405,7 +399,7 @@ fn build_ui(app: &Application) {
         }
     });
 
-    // --- UI Update Loop (GTK Thread) ---
+    // GTK UI Thread
     glib::spawn_future_local(async move {
         while let Some(msg) = ui_receiver.recv().await {
             match msg {
@@ -452,20 +446,15 @@ fn build_ui(app: &Application) {
                     }
                 }
                 UiMessage::ToolUse(name, desc) => {
-                    *current_bot_label.borrow_mut() = None; // Break text stream
+                    *current_bot_label.borrow_mut() = None;
                     let tool_card = GtkBox::new(Orientation::Vertical, 4);
                     tool_card.add_css_class("tool-card");
-                    
                     let header = GtkBox::new(Orientation::Horizontal, 8);
                     let icon = Image::from_icon_name("applications-engineering-symbolic");
                     let title = Label::builder().label(&format!("🛠️ Executed Tool: {}", name)).xalign(0.0).css_classes(["tool-header"]).build();
-                    header.append(&icon);
-                    header.append(&title);
-                    
+                    header.append(&icon); header.append(&title);
                     let body = Label::builder().label(&desc).wrap(true).xalign(0.0).css_classes(["tool-desc"]).build();
-                    
-                    tool_card.append(&header);
-                    tool_card.append(&body);
+                    tool_card.append(&header); tool_card.append(&body);
                     chat_box_clone.append(&tool_card);
                 }
                 UiMessage::EngineOutput(m) => {
@@ -474,8 +463,7 @@ fn build_ui(app: &Application) {
                         let container = GtkBox::builder().css_classes(["bot-bubble"]).orientation(Orientation::Horizontal).halign(Align::Fill).build();
                         let bot_icon = Image::builder().icon_name("weather-clear-night-symbolic").pixel_size(24).css_classes(["bot-icon"]).valign(Align::Start).build();
                         let label = Label::builder().label(&m).wrap(true).xalign(0.0).selectable(true).hexpand(true).build();
-                        container.append(&bot_icon);
-                        container.append(&label);
+                        container.append(&bot_icon); container.append(&label);
                         chat_box_clone.append(&container);
                         *bot_opt = Some(label);
                     } else {
@@ -499,46 +487,80 @@ fn build_ui(app: &Application) {
         }
     });
 
-    // --- Tokio Async Worker Loop ---
+    // Tokio Async Worker
     let ui_sender_clone = ui_sender.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
         rt.block_on(async move {
-            // Load sessions asynchronously on startup
             if let Ok(output) = Command::new("gemini").arg("--list-sessions").output().await {
                 let out_str = String::from_utf8_lossy(&output.stdout);
                 let mut sessions = vec![];
                 for line in out_str.lines() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with(char::is_numeric) {
-                        sessions.push(trimmed.to_string());
-                    }
+                    if trimmed.starts_with(char::is_numeric) { sessions.push(trimmed.to_string()); }
                 }
                 ui_sender_clone.send(UiMessage::SessionsLoaded(sessions)).await.unwrap();
             }
 
-            while let Some((prompt, cwd, yolo, session_id)) = async_receiver.recv().await {
+            while let Some((prompt, cwd, yolo, session_id, is_history)) = async_receiver.recv().await {
+                
+                // HISTORY RESTORE LOGIC
+                if is_history {
+                    if let Some(uuid) = session_id {
+                        let short_uuid = uuid.split('-').next().unwrap_or(&uuid);
+                        if let Ok(output) = Command::new("find").arg(dirs::home_dir().unwrap().join(".gemini")).arg("-type").arg("f").arg("-name").arg(format!("*{}*.json", short_uuid)).output().await {
+                            let path_str = String::from_utf8_lossy(&output.stdout);
+                            if let Some(first_path) = path_str.lines().next() {
+                                if let Ok(contents) = tokio::fs::read_to_string(first_path).await {
+                                    if let Ok(history) = serde_json::from_str::<HistoryFile>(&contents) {
+                                        if let Some(msgs) = history.messages {
+                                            for msg in msgs {
+                                                if msg.msg_type.as_deref() == Some("user") {
+                                                    if let Some(content) = msg.content {
+                                                        if let Some(arr) = content.as_array() {
+                                                            if let Some(obj) = arr.get(0) {
+                                                                if let Some(txt) = obj.get("text").and_then(|t| t.as_str()) {
+                                                                    ui_sender_clone.send(UiMessage::NewUserMessage(txt.to_string())).await.unwrap();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else if msg.msg_type.as_deref() == Some("gemini") {
+                                                    if let Some(content) = msg.content {
+                                                        if let Some(txt) = content.as_str() {
+                                                            ui_sender_clone.send(UiMessage::EngineOutput(txt.to_string())).await.unwrap();
+                                                            ui_sender_clone.send(UiMessage::Done).await.unwrap(); // flush the bubble
+                                                        }
+                                                    }
+                                                    if let Some(calls) = msg.tool_calls {
+                                                        for call in calls {
+                                                            let name = call.name.unwrap_or_default();
+                                                            let desc = call.args.map(|p| p.to_string()).unwrap_or_default();
+                                                            ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ui_sender_clone.send(UiMessage::SystemMessage("Resumed session.".to_string())).await.unwrap();
+                    }
+                    continue; // History loaded, don't spawn gemini yet!
+                }
+
+                // NORMAL PROMPT EXECUTION
                 ui_sender_clone.send(UiMessage::SystemMessage("Thinking...".to_string())).await.unwrap();
 
                 let mut cmd = Command::new("gemini");
-                cmd.current_dir(&cwd)
-                   .arg("-p")
-                   .arg(&prompt)
-                   .arg("-o")
-                   .arg("stream-json")
-                   .stdout(Stdio::piped())
-                   .stderr(Stdio::piped());
+                cmd.current_dir(&cwd).arg("-p").arg(&prompt).arg("-o").arg("stream-json")
+                   .stdout(Stdio::piped()).stderr(Stdio::piped());
 
-                if yolo {
-                    cmd.arg("-y");
-                }
-                if let Some(sid) = session_id {
-                    cmd.arg("-r").arg(&sid);
-                }
+                if yolo { cmd.arg("-y"); }
+                if let Some(sid) = session_id { cmd.arg("-r").arg(&sid); }
 
                 let mut child = match cmd.spawn() {
                     Ok(child) => child,
@@ -555,17 +577,13 @@ fn build_ui(app: &Application) {
                 while let Ok(Some(line)) = reader.next_line().await {
                     if let Ok(parsed) = serde_json::from_str::<RawStream>(&line) {
                         if parsed.msg_type.as_deref() == Some("message") && parsed.role.as_deref() == Some("assistant") {
-                            if let Some(txt) = parsed.content {
-                                ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap();
-                            }
+                            if let Some(txt) = parsed.content { ui_sender_clone.send(UiMessage::EngineOutput(txt)).await.unwrap(); }
                         } else if parsed.msg_type.as_deref() == Some("tool_use") {
                             let name = parsed.tool_name.unwrap_or_else(|| "Unknown".to_string());
                             let desc = parsed.parameters.map(|p| p.to_string()).unwrap_or_default();
                             ui_sender_clone.send(UiMessage::ToolUse(name, desc)).await.unwrap();
                         } else if parsed.msg_type.as_deref() == Some("result") && parsed.status.as_deref() == Some("error") {
-                            if let Some(err) = parsed.error {
-                                ui_sender_clone.send(UiMessage::Error(err)).await.unwrap();
-                            }
+                            if let Some(err) = parsed.error { ui_sender_clone.send(UiMessage::Error(err)).await.unwrap(); }
                         }
                     }
                 }
@@ -575,7 +593,6 @@ fn build_ui(app: &Application) {
         });
     });
 
-    // --- Input Actions ---
     let async_sender_clone = async_sender.clone();
     let prompt_entry_clone = prompt_entry.clone();
     let ui_sender_input = ui_sender.clone();
@@ -587,7 +604,6 @@ fn build_ui(app: &Application) {
         let text = prompt_entry_clone.text().to_string();
         if !text.trim().is_empty() {
             prompt_entry_clone.set_text("");
-            
             let async_sender_local = async_sender_clone.clone();
             let ui_sender_local = ui_sender_input.clone();
             let cwd = current_dir_action.borrow().clone();
@@ -596,7 +612,7 @@ fn build_ui(app: &Application) {
             
             glib::spawn_future_local(async move {
                 ui_sender_local.send(UiMessage::NewUserMessage(text.clone())).await.unwrap();
-                if let Err(e) = async_sender_local.send((text, cwd, yolo, session)).await {
+                if let Err(e) = async_sender_local.send((text, cwd, yolo, session, false)).await {
                     eprintln!("Failed to send to async runtime: {}", e);
                 }
             });
@@ -611,13 +627,7 @@ fn build_ui(app: &Application) {
 }
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder()
-        .application_id("com.github.redminote11tech.GeminiExtended")
-        .build();
-
-    app.connect_activate(move |app| {
-        build_ui(app);
-    });
-
+    let app = Application::builder().application_id("com.github.redminote11tech.GeminiExtended").build();
+    app.connect_activate(move |app| { build_ui(app); });
     app.run()
 }
